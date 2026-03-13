@@ -411,6 +411,8 @@ class AssettoCorsaData:
 # Se None, viene saltato il click e si usa solo Ctrl+R.
 AC_RESTART_CLICK_POS: tuple[int, int] | None = None   # es: (960, 540)
 
+AC_RESTART_CLICK_POS = (57,182)
+
 def send_reset_to_ac(delay: float = 0.3) -> None:
     """
     Invia Ctrl+R ad Assetto Corsa per terminare la sessione corrente,

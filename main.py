@@ -34,7 +34,7 @@ BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
 # ---------------------------------------------------------------------------
 
 MAX_TYRES_OUT   = 3          # N° ruote fuori che scatena reset + penalità
-PENALTY_TYRES   = -1000.0   # Penalità istantanea per troppe ruote fuori pista
+PENALTY_TYRES   = -2000.0   # Penalità istantanea per troppe ruote fuori pista
 MAX_DIST_RESET  = 6.0        # Distanza (m) dalla linea ideale che forza il reset
 MAX_RPM_REF     = 8500.0     # RPM massimi di riferimento per normalizzazione
 STEP_DELAY      = 0.001      # Secondi tra uno step e il successivo
@@ -42,7 +42,7 @@ STEP_DELAY      = 0.001      # Secondi tra uno step e il successivo
 # Pesi del reward principale
 W_SPEED         = 1.2        # Premia la velocità
 W_RPM           = 0.8        # Premia RPM alti
-W_LINE_PENALTY  = 20.0        # Penalizza la deviazione dalla linea ideale
+W_LINE_PENALTY  = 4.0        # Penalizza la deviazione dalla linea ideale
 LINE_EXP        = 2.5        # Esponente penalità distanza (>2 = aggressivo)
 
 # Pesi reward checkpoint / corner braking
