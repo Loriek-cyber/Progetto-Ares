@@ -15,10 +15,12 @@ from stable_baselines3 import PPO
 
 from utils.driver import (
     AssettoCorsaData,
+    CheckpointSystem,
     get_track_name,
     get_car_position,
     load_ai_line,
     build_kdtree,
+    send_reset_to_ac,
 )
 
 # ---------------------------------------------------------------------------
@@ -31,18 +33,27 @@ BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
 # Parametri di training — modifica qui per fare tuning
 # ---------------------------------------------------------------------------
 
-MAX_TYRES_OUT   = 3        # N° ruote fuori che scatena reset + penalità
-PENALTY_TYRES   = -1000.0    # Penalità istantanea per troppe ruote fuori pista
-MAX_DIST_RESET  = 6.0      # Distanza (m) dalla linea ideale che forza il reset
-MAX_RPM_REF     = 8500.0   # RPM massimi di riferimento per normalizzazione
-STEP_DELAY      = 0.005    # Secondi tra uno step e il successivo (basso = più veloce)
+MAX_TYRES_OUT   = 3          # N° ruote fuori che scatena reset + penalità
+PENALTY_TYRES   = -1000.0   # Penalità istantanea per troppe ruote fuori pista
+MAX_DIST_RESET  = 6.0        # Distanza (m) dalla linea ideale che forza il reset
+MAX_RPM_REF     = 8500.0     # RPM massimi di riferimento per normalizzazione
+STEP_DELAY      = 0.001      # Secondi tra uno step e il successivo
 
-# Pesi del reward
-W_SPEED         = 1.2      # Premia la velocità
-W_RPM           = 0.8      # Premia RPM alti
-W_LINE_PENALTY  = 4.0      # Penalizza la deviazione dalla linea ideale (aumentato)
-LINE_EXP        = 2.5      # Esponente per la penalità di distanza (>2 = molto aggressivo)
+# Pesi del reward principale
+W_SPEED         = 1.2        # Premia la velocità
+W_RPM           = 0.8        # Premia RPM alti
+W_LINE_PENALTY  = 20.0        # Penalizza la deviazione dalla linea ideale
+LINE_EXP        = 2.5        # Esponente penalità distanza (>2 = aggressivo)
 
+# Pesi reward checkpoint / corner braking
+W_PROGRESS      = 5.0        # Moltiplica il reward di avanzamento checkpoint
+W_BACKTRACK     = 3.0        # Moltiplica la penalità di retrocessione
+W_BRAKING       = 6.0        # Penalità per entrare troppo veloce in curva
+CORNER_DIST_REF = 200.0      # Distanza di riferimento per normalizzazione curva (m)
+
+# Decellerazione fisica massima ragionevole per calcolo braking (m/s²)
+MAX_BRAKE_DECEL = 18.0       # ~1.8g di frenata massima
+CAR_DAMAGE_MAX = 1
 
 # ---------------------------------------------------------------------------
 # Ambiente Gymnasium
@@ -50,9 +61,24 @@ LINE_EXP        = 2.5      # Esponente per la penalità di distanza (>2 = molto 
 
 class AssettoCorsaEnv(gym.Env):
     """
-    Ambiente Gymnasium per Assetto Corsa.
-    Observation (7,): [speed_norm, dist_norm, g_lat, g_long, steer_norm, rpm_norm, tyres_out_norm]
-    Action      (3,): [steer ∈ [-1,1], throttle ∈ [0,1], brake ∈ [0,1]]
+    Ambiente Gymnasium per Assetto Corsa con sistema a checkpoint e corner braking.
+
+    Observation (10,):
+      [0] speed_norm          velocità normalizzata (0..1)
+      [1] dist_norm           distanza dalla linea ideale normalizzata
+      [2] g_lat               accelerazione laterale (g)
+      [3] g_long              accelerazione longitudinale (g)
+      [4] steer_norm          sterzo normalizzato (-1..1)
+      [5] rpm_norm            RPM normalizzati (0..1)
+      [6] tyres_out_norm      ruote fuori (0..1)
+      [7] corner_dist_norm    distanza alla prossima curva normalizzata (0..1)
+      [8] corner_speed_norm   velocità target alla curva normalizzata (0..1)
+      [9] speed_excess_norm   eccesso di velocità rispetto al braking point (0..1+)
+
+    Action (3,):
+      [0] steer      ∈ [-1, 1]
+      [1] throttle   ∈ [ 0, 1]
+      [2] brake      ∈ [ 0, 1]
     """
 
     metadata = {"render_modes": []}
@@ -63,7 +89,7 @@ class AssettoCorsaEnv(gym.Env):
         # --- Gamepad ---
         self.gamepad = vg.VX360Gamepad()
 
-        # --- Telemetria (driver) ---
+        # --- Telemetria ---
         self.asm = AssettoCorsaData()
         self.asm.start()
 
@@ -75,8 +101,9 @@ class AssettoCorsaEnv(gym.Env):
         if not os.path.exists(ai_path):
             raise FileNotFoundError(f"File AI non trovato: {ai_path}")
 
-        self.ai_line = load_ai_line(ai_path)
-        self.kdtree  = build_kdtree(self.ai_line)
+        self.ai_line   = load_ai_line(ai_path)
+        self.kdtree    = build_kdtree(self.ai_line)
+        self.checkpoints = CheckpointSystem(self.ai_line, self.kdtree)
 
         # --- Spazi ---
         self.action_space = spaces.Box(
@@ -84,7 +111,7 @@ class AssettoCorsaEnv(gym.Env):
             high = np.array([ 1.0, 1.0, 1.0], dtype=np.float32),
         )
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
         )
 
     # ------------------------------------------------------------------
@@ -92,31 +119,59 @@ class AssettoCorsaEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def _read_state(self) -> dict:
-        """Legge telemetria + posizione e ritorna un dizionario con i valori grezzi."""
+        """Legge telemetria, posizione e info checkpoint. Ritorna stato grezzo."""
         self.asm.update()
-        x, z     = get_car_position()
-        dist, _  = self.kdtree.query([x, z])
+
+        x, z = get_car_position()
+
+        # KDTree query per distanza dalla linea ideale
+        dist, _ = self.kdtree.query([x, z])
+
+        # Aggiorna sistema checkpoint (avanzamento + rilevamento curva)
+        cp_info = self.checkpoints.update(x, z)
 
         return {
-            "speed"    : self.asm.speed,          # km/h
-            "rpm"      : self.asm.rpm,
-            "steer"    : self.asm.steerAngle,     # gradi [-180, 180]
-            "g_lat"    : self.asm.accGX,
-            "g_long"   : self.asm.accGY,
-            "tyres_out": self.asm.tyres_out,      # int 0..4
-            "dist"     : float(dist),             # metri dalla linea ideale
+            "speed"           : self.asm.speed,       # km/h
+            "rpm"             : self.asm.rpm,
+            "steer"           : self.asm.steerAngle,  # gradi
+            "g_lat"           : self.asm.accGX,
+            "g_long"          : self.asm.accGY,
+            "tyres_out"       : self.asm.tyres_out,   # int 0..4
+            "car_damage"      : self.asm.car_damage_total,  # somma danni carrozzeria
+            "dist"            : float(dist),           # m dalla linea
+            "progress_reward" : cp_info["progress_reward"],
+            "backtrack_penalty": cp_info["backtrack_penalty"],
+            "checkpoint_hit"  : cp_info["checkpoint_hit"],
+            "corner_dist_m"   : cp_info["corner_dist_m"],   # m alla prossima curva
+            "corner_speed"    : cp_info["corner_speed"],     # km/h target alla curva
         }
 
     def _make_obs(self, state: dict) -> np.ndarray:
-        """Costruisce il vettore di osservazione normalizzato."""
+        """Costruisce il vettore di osservazione normalizzato (10,)."""
+        speed_ms       = state["speed"] / 3.6         # km/h → m/s
+        corner_speed_ms = state["corner_speed"] / 3.6
+
+        # Calcolo eccesso di velocità rispetto al braking point:
+        # Per frenare da v_now a v_corner in dist_corner metri servono
+        # a = (v_now² - v_corner²) / (2 * dist_corner)
+        # Se a > MAX_BRAKE_DECEL → stai entrando troppo forte in curva
+        d = max(state["corner_dist_m"], 1.0)  # evita divisione per 0
+        required_decel = max(
+            (speed_ms**2 - corner_speed_ms**2) / (2.0 * d), 0.0
+        )
+        speed_excess = required_decel / MAX_BRAKE_DECEL  # 0 = ok, >1 = missile
+
         return np.array([
-            state["speed"]     / 300.0,          # 0..1 (auto raramente > 300 km/h)
-            state["dist"]      / MAX_DIST_RESET,  # 0..1+ (>1 → reset imminente)
-            state["g_lat"],                       # raw (già in g)
-            state["g_long"],                      # raw
-            state["steer"]     / 180.0,           # -1..1
-            state["rpm"]       / MAX_RPM_REF,     # 0..1
-            state["tyres_out"] / 4.0,             # 0..1
+            state["speed"]      / 300.0,           # [0] speed_norm
+            state["dist"]       / MAX_DIST_RESET,  # [1] dist_norm
+            state["g_lat"],                         # [2] g_lat
+            state["g_long"],                        # [3] g_long
+            state["steer"]      / 180.0,            # [4] steer_norm
+            state["rpm"]        / MAX_RPM_REF,      # [5] rpm_norm
+            state["tyres_out"]  / 4.0,              # [6] tyres_out_norm
+            state["corner_dist_m"] / CORNER_DIST_REF,  # [7] corner_dist_norm
+            state["corner_speed"]  / 300.0,         # [8] corner_speed_norm
+            np.clip(speed_excess, 0.0, 3.0),        # [9] speed_excess_norm
         ], dtype=np.float32)
 
     # ------------------------------------------------------------------
@@ -125,20 +180,42 @@ class AssettoCorsaEnv(gym.Env):
 
     def _compute_reward(self, state: dict) -> float:
         """
-        Reward shaping:
-          + velocità alta      →  guida aggressiva
-          + RPM alti           →  incentiva gear alto e motore al limite
-          - (dist^exp) * peso  →  penalità FORTE per deviazione dalla traiettoria
-          - penalità flat      →  se > MAX_TYRES_OUT ruote fuori
+        Reward shaping completo:
+          + velocità alta          → incentiva spingere forte
+          + RPM alti               → incentiva gear alto
+          + progresso checkpoint   → segui la traiettoria in avanti
+          - penalità linea         → non uscire dalla traiettoria
+          - backtrack              → non tornare indietro
+          - braking penalty        → rallenta prima delle curve
+          - tyres out              → non uscire dalla pista
         """
-        speed_r = state["speed"] / 10.0 * W_SPEED
-        rpm_r   = (state["rpm"] / MAX_RPM_REF) * W_RPM
-        dist_p  = -(state["dist"] ** LINE_EXP) * W_LINE_PENALTY
+        speed_ms       = state["speed"] / 3.6
+        corner_speed_ms = state["corner_speed"] / 3.6
+        d              = max(state["corner_dist_m"], 1.0)
 
-        print(dist_p)
+        # --- Componenti positivi ---
+        speed_r    = state["speed"] / 10.0 * W_SPEED
+        rpm_r      = (state["rpm"] / MAX_RPM_REF) * W_RPM
+        progress_r = state["progress_reward"] * W_PROGRESS
 
-        reward = speed_r + rpm_r + dist_p
+        # --- Componenti negativi ---
+        dist_p      = -(state["dist"] ** LINE_EXP) * W_LINE_PENALTY
+        backtrack_p = state["backtrack_penalty"] * W_BACKTRACK
 
+        # Penalità braking: quanto stai eccedendo la decelerazione fisica massima
+        required_decel = max(
+            (speed_ms**2 - corner_speed_ms**2) / (2.0 * d), 0.0
+        )
+        speed_excess = required_decel / MAX_BRAKE_DECEL
+        # Penalità graduata: entra solo quando >0.5, cresce esponenzialmente
+        if speed_excess > 0.5:
+            braking_p = -((speed_excess - 0.5) ** 2) * W_BRAKING
+        else:
+            braking_p = 0.0
+
+        reward = speed_r + rpm_r + progress_r + dist_p + backtrack_p + braking_p
+
+        # --- Penalità piatta per uscita di pista ---
         if state["tyres_out"] > MAX_TYRES_OUT:
             reward += PENALTY_TYRES
 
@@ -149,10 +226,9 @@ class AssettoCorsaEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def step(self, action):
-        # Applica i comandi al gamepad
         self.gamepad.left_joystick_float(x_value_float=float(action[0]), y_value_float=0.0)
-        self.gamepad.right_trigger_float(value_float=float(action[1]))  # acceleratore
-        self.gamepad.left_trigger_float (value_float=float(action[2]))  # freno
+        self.gamepad.right_trigger_float(value_float=float(action[1]))  # gas
+        self.gamepad.left_trigger_float(value_float=float(action[2]))   # freno
         self.gamepad.update()
 
         time.sleep(STEP_DELAY)
@@ -161,16 +237,29 @@ class AssettoCorsaEnv(gym.Env):
         obs    = self._make_obs(state)
         reward = self._compute_reward(state)
 
+        # --- Log di debug ---
+        if state["checkpoint_hit"]:
+            print(f"[CP] Checkpoint! reward_progress={state['progress_reward']:.3f} "
+                  f"| corner_in={state['corner_dist_m']:.0f}m "
+                  f"@ {state['corner_speed']:.0f}km/h")
+
         # --- Condizioni di terminazione ---
         terminated = False
 
-        if state["tyres_out"] > MAX_TYRES_OUT:
-            print(f"[RESET] {state['tyres_out']} ruote fuori | penalty={PENALTY_TYRES}")
+        if state["tyres_out"] >= MAX_TYRES_OUT:
+            print(f"[RESET] {state['tyres_out']} ruote fuori pista")
+            terminated = True
+
+        if state["car_damage"] >= CAR_DAMAGE_MAX:
+            print(f"[RESET] Danno carrozzeria: {state['car_damage']:.1f}")
             terminated = True
 
         if state["dist"] > MAX_DIST_RESET:
-            print(f"[RESET] Distanza dalla traiettoria: {state['dist']:.2f} m")
+            print(f"[RESET] Distanza traiettoria: {state['dist']:.2f} m")
             terminated = True
+
+        if terminated:
+            send_reset_to_ac()   # Ctrl+R in game
 
         return obs, reward, terminated, False, state
 
@@ -178,7 +267,8 @@ class AssettoCorsaEnv(gym.Env):
         super().reset(seed=seed)
         self.gamepad.reset()
         self.gamepad.update()
-        time.sleep(0.5)          # dai tempo al gioco di recepire il reset
+        self.checkpoints.reset()
+        time.sleep(0.5)
         state = self._read_state()
         return self._make_obs(state), {}
 
@@ -211,7 +301,7 @@ if __name__ == "__main__":
             n_steps       = 2048,
             batch_size    = 64,
             gamma         = 0.99,
-            ent_coef      = 0.01,    # esplorazione
+            ent_coef      = 0.01,
             clip_range    = 0.2,
         )
 
