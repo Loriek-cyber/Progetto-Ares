@@ -1,6 +1,7 @@
 import mmap
 import struct
 import time
+import os
 import numpy as np
 import vgamepad as vg
 from scipy.spatial import KDTree
@@ -8,29 +9,44 @@ from stable_baselines3 import PPO
 import gymnasium as gym
 from gymnasium import spaces
 
-# --- CONFIGURAZIONE MEMORIA AC ---
+# --- CONFIGURAZIONE PERCORSI ---
+BASE_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
 AC_SM_PHYSICS = "Local\\AcTools.Physics"
+AC_SM_STATIC = "Local\\AcTools.Static"
 
 
-class AssettoCorsaViGEmEnv(gym.Env):
-    def __init__(self, ai_path):
-        super(AssettoCorsaViGEmEnv, self).__init__()
-
-        # 1. Inizializzazione Controller Xbox Virtuale
+class AssettoCorsaMultiTrackEnv(gym.Env):
+    def __init__(self):
+        super(AssettoCorsaMultiTrackEnv, self).__init__()
         self.gamepad = vg.VX360Gamepad()
-        print(">>> Controller Xbox 360 Virtuale (ViGEm) inizializzato.")
 
-        # 2. Caricamento Traiettoria
+        # Identifica la pista attualmente caricata in AC
+        self.track_name = self._get_current_track_name()
+        print(f">>> Pista rilevata: {self.track_name}")
+
+        # Carica il file AI specifico per la pista rilevata
+        ai_path = os.path.join(BASE_PATH, self.track_name, "ai", "fast_lane.ai")
+        if not os.path.exists(ai_path):
+            raise FileNotFoundError(f"File AI non trovato per {self.track_name} in {ai_path}")
+
         self.ideal_line = self._parse_ai_file(ai_path)
         self.kdtree = KDTree(self.ideal_line[:, [0, 2]])
 
-        # 3. Spazi IA
-        # Action: [Sterzo (-1 a 1), Gas (0 a 1), Freno (0 a 1)]
         self.action_space = spaces.Box(low=np.array([-1, 0, 0]), high=np.array([1, 1, 1]), dtype=np.float32)
-        # Obs: [Velocità, Errore Lat, G-Lat, G-Long, Input_Sterzo_Precedente]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
 
-        self.prev_steer = 0.0
+    def _get_current_track_name(self):
+        """ Legge la Shared Memory Static per capire su che pista siamo """
+        try:
+            # AC_SM_STATIC contiene il nome della pista a partire dall'offset 20 (circa)
+            shm_static = mmap.mmap(0, 512, AC_SM_STATIC, access=mmap.ACCESS_READ)
+            # Leggiamo i byte e decodifichiamo (stringa Unicode in AC)
+            track_bytes = shm_static[20:80].split(b'\x00')[0]
+            track_name = track_bytes.decode('utf-16').strip()
+            shm_static.close()
+            return track_name if track_name else "monza"  # Fallback
+        except:
+            return "monza"
 
     def _parse_ai_file(self, path):
         points = []
@@ -55,70 +71,46 @@ class AssettoCorsaViGEmEnv(gym.Env):
             return {"x": 0, "z": 0, "speed": 0, "g_lat": 0, "g_long": 0}
 
     def step(self, action):
-        # --- INPUT CONTROLLER XBOX ---
-        # Sterzo: Stick Sinistro (X_AXIS: da -1.0 a 1.0)
         self.gamepad.left_joystick_float(x_value_float=action[0], y_value_float=0.0)
-
-        # Acceleratore: Trigger Destro (da 0.0 a 1.0)
         self.gamepad.right_trigger_float(value_float=action[1])
-
-        # Freno: Trigger Sinistro (da 0.0 a 1.0)
         self.gamepad.left_trigger_float(value_float=action[2])
-
-        # Applica i cambiamenti
         self.gamepad.update()
 
-        # Tempo di campionamento
         time.sleep(0.01)
-
-        # --- TELEMETRIA E REWARD ---
         tel = self._get_telemetry()
         dist, _ = self.kdtree.query([tel['x'], tel['z']])
 
-        # Reward: penalizziamo l'errore laterale in modo esponenziale
+
         reward = (tel['speed'] / 30.0) - (dist ** 2)
+        obs = np.array([tel['speed'] / 250.0, dist / 10.0, tel['g_lat'], tel['g_long'], action[0]], dtype=np.float32)
 
-        # Bonus per velocità minima (non restare fermi)
-        if tel['speed'] < 10: reward -= 2.0
-
-        obs = np.array([
-            tel['speed'] / 250.0,
-            dist / 10.0,
-            tel['g_lat'],
-            tel['g_long'],
-            action[0]
-        ], dtype=np.float32)
-
-        # Reset se l'auto vola fuori pista (7 metri)
-        terminated = dist > 7.0
-        return obs, reward, terminated, False, {}
+        return obs, reward, dist > 7.0, False, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # Reset controller
         self.gamepad.reset()
         self.gamepad.update()
         return np.zeros(5, dtype=np.float32), {}
 
 
-# --- TRAINING ---
+# --- LOGICA DI CARICAMENTO E SALVATAGGIO ---
 if __name__ == "__main__":
-    AI_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks/monza/ai/fast_lane.ai"
-    env = AssettoCorsaViGEmEnv(AI_PATH)
+    env = AssettoCorsaMultiTrackEnv()
+    model_name = f"model_{env.track_name}"
+    model_path = f"{model_name}.zip"
 
-    # PPO è robusto per il controllo continuo
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, n_steps=5000)
-
-    print("\n" + "=" * 50)
-    print(">>> CONTROLLER XBOX VIRTUALE ATTIVO.")
-    print(">>> In Assetto Corsa, vai in 'Controls' e seleziona 'Gamepad'.")
-    print(">>> Verifica che gli indicatori si muovano!")
-    print("=" * 50 + "\n")
+    if os.path.exists(model_path):
+        print(f">>> Trovato modello salvato per {env.track_name}. Caricamento in corso...")
+        model = PPO.load(model_path, env=env)
+    else:
+        print(f">>> Nessun salvataggio per {env.track_name}. Creazione nuovo modello...")
+        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003)
 
     try:
+        # Loop di apprendimento
         model.learn(total_timesteps=1000000)
     except KeyboardInterrupt:
-        print("\n[STOP] Salvataggio modello...")
+        print("\n[INTERRUZIONE] Salvataggio progressi...")
     finally:
-        model.save("models/ac_vigem_ai")
-        print(">>> Modello salvato come: ac_vige_ai.zip")
+        model.save(model_name)
+        print(f">>> Modello {model_name} salvato correttamente.")
