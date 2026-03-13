@@ -1,116 +1,223 @@
-import mmap
-import struct
-import time
+"""
+main.py — Ambiente RL per Assetto Corsa
+Logica pura: Env Gymnasium + Training PPO.
+Tutti i dati vengono letti tramite utils.driver.
+"""
+
 import os
+import time
+
 import numpy as np
 import vgamepad as vg
-from scipy.spatial import KDTree
-from stable_baselines3 import PPO
 import gymnasium as gym
 from gymnasium import spaces
+from stable_baselines3 import PPO
 
-# --- CONFIGURAZIONE PERCORSI ---
-BASE_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
-AC_SM_PHYSICS = "Local\\AcTools.Physics"
-AC_SM_STATIC = "Local\\AcTools.Static"
+from utils.driver import (
+    AssettoCorsaData,
+    get_track_name,
+    get_car_position,
+    load_ai_line,
+    build_kdtree,
+)
+
+# ---------------------------------------------------------------------------
+# Percorsi
+# ---------------------------------------------------------------------------
+
+BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
+
+# ---------------------------------------------------------------------------
+# Parametri di training — modifica qui per fare tuning
+# ---------------------------------------------------------------------------
+
+MAX_TYRES_OUT   = 3        # N° ruote fuori che scatena reset + penalità
+PENALTY_TYRES   = -15.0    # Penalità istantanea per troppe ruote fuori pista
+MAX_DIST_RESET  = 6.0      # Distanza (m) dalla linea ideale che forza il reset
+MAX_RPM_REF     = 8500.0   # RPM massimi di riferimento per normalizzazione
+STEP_DELAY      = 0.005    # Secondi tra uno step e il successivo (basso = più veloce)
+
+# Pesi del reward
+W_SPEED         = 1.2      # Premia la velocità
+W_RPM           = 0.8      # Premia RPM alti
+W_LINE_PENALTY  = 4.0      # Penalizza la deviazione dalla linea ideale (aumentato)
+LINE_EXP        = 2.5      # Esponente per la penalità di distanza (>2 = molto aggressivo)
 
 
-class AssettoCorsaMultiTrackEnv(gym.Env):
+# ---------------------------------------------------------------------------
+# Ambiente Gymnasium
+# ---------------------------------------------------------------------------
+
+class AssettoCorsaEnv(gym.Env):
+    """
+    Ambiente Gymnasium per Assetto Corsa.
+    Observation (7,): [speed_norm, dist_norm, g_lat, g_long, steer_norm, rpm_norm, tyres_out_norm]
+    Action      (3,): [steer ∈ [-1,1], throttle ∈ [0,1], brake ∈ [0,1]]
+    """
+
+    metadata = {"render_modes": []}
+
     def __init__(self):
-        super(AssettoCorsaMultiTrackEnv, self).__init__()
+        super().__init__()
+
+        # --- Gamepad ---
         self.gamepad = vg.VX360Gamepad()
 
-        # Identifica la pista attualmente caricata in AC
-        self.track_name = self._get_current_track_name()
-        print(f">>> Pista rilevata: {self.track_name}")
+        # --- Telemetria (driver) ---
+        self.asm = AssettoCorsaData()
+        self.asm.start()
 
-        # Carica il file AI specifico per la pista rilevata
-        ai_path = os.path.join(BASE_PATH, self.track_name, "ai", "fast_lane.ai")
+        # --- Pista e linea ideale ---
+        self.track_name = get_track_name()
+        print(f"[Env] Pista rilevata: {self.track_name}")
+
+        ai_path = os.path.join(BASE_TRACK_PATH, self.track_name, "ai", "fast_lane.ai")
         if not os.path.exists(ai_path):
-            raise FileNotFoundError(f"File AI non trovato per {self.track_name} in {ai_path}")
+            raise FileNotFoundError(f"File AI non trovato: {ai_path}")
 
-        self.ideal_line = self._parse_ai_file(ai_path)
-        self.kdtree = KDTree(self.ideal_line[:, [0, 2]])
+        self.ai_line = load_ai_line(ai_path)
+        self.kdtree  = build_kdtree(self.ai_line)
 
-        self.action_space = spaces.Box(low=np.array([-1, 0, 0]), high=np.array([1, 1, 1]), dtype=np.float32)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+        # --- Spazi ---
+        self.action_space = spaces.Box(
+            low  = np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+            high = np.array([ 1.0, 1.0, 1.0], dtype=np.float32),
+        )
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32
+        )
 
-    def _get_current_track_name(self):
-        """ Legge la Shared Memory Static per capire su che pista siamo """
-        try:
-            # AC_SM_STATIC contiene il nome della pista a partire dall'offset 20 (circa)
-            shm_static = mmap.mmap(0, 512, AC_SM_STATIC, access=mmap.ACCESS_READ)
-            # Leggiamo i byte e decodifichiamo (stringa Unicode in AC)
-            track_bytes = shm_static[20:80].split(b'\x00')[0]
-            track_name = track_bytes.decode('utf-16').strip()
-            shm_static.close()
-            return track_name if track_name else "monza"  # Fallback
-        except:
-            return "monza"
+    # ------------------------------------------------------------------
+    # Lettura stato
+    # ------------------------------------------------------------------
 
-    def _parse_ai_file(self, path):
-        points = []
-        with open(path, "rb") as f:
-            num_points = struct.unpack('i', f.read(4))[0]
-            for _ in range(num_points):
-                data = struct.unpack('fffffff', f.read(28))
-                points.append(data)
-        return np.array(points)
+    def _read_state(self) -> dict:
+        """Legge telemetria + posizione e ritorna un dizionario con i valori grezzi."""
+        self.asm.update()
+        x, z     = get_car_position()
+        dist, _  = self.kdtree.query([x, z])
 
-    def _get_telemetry(self):
-        try:
-            shm = mmap.mmap(0, 800, AC_SM_PHYSICS, access=mmap.ACCESS_READ)
-            speed = struct.unpack('f', shm[28:32])[0]
-            g_lat = struct.unpack('f', shm[32:36])[0]
-            g_long = struct.unpack('f', shm[40:44])[0]
-            x = struct.unpack('f', shm[60:64])[0]
-            z = struct.unpack('f', shm[68:72])[0]
-            shm.close()
-            return {"x": x, "z": z, "speed": speed, "g_lat": g_lat, "g_long": g_long}
-        except:
-            return {"x": 0, "z": 0, "speed": 0, "g_lat": 0, "g_long": 0}
+        return {
+            "speed"    : self.asm.speed,          # km/h
+            "rpm"      : self.asm.rpm,
+            "steer"    : self.asm.steerAngle,     # gradi [-180, 180]
+            "g_lat"    : self.asm.accGX,
+            "g_long"   : self.asm.accGY,
+            "tyres_out": self.asm.tyres_out,      # int 0..4
+            "dist"     : float(dist),             # metri dalla linea ideale
+        }
+
+    def _make_obs(self, state: dict) -> np.ndarray:
+        """Costruisce il vettore di osservazione normalizzato."""
+        return np.array([
+            state["speed"]     / 300.0,          # 0..1 (auto raramente > 300 km/h)
+            state["dist"]      / MAX_DIST_RESET,  # 0..1+ (>1 → reset imminente)
+            state["g_lat"],                       # raw (già in g)
+            state["g_long"],                      # raw
+            state["steer"]     / 180.0,           # -1..1
+            state["rpm"]       / MAX_RPM_REF,     # 0..1
+            state["tyres_out"] / 4.0,             # 0..1
+        ], dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Reward
+    # ------------------------------------------------------------------
+
+    def _compute_reward(self, state: dict) -> float:
+        """
+        Reward shaping:
+          + velocità alta      →  guida aggressiva
+          + RPM alti           →  incentiva gear alto e motore al limite
+          - (dist^exp) * peso  →  penalità FORTE per deviazione dalla traiettoria
+          - penalità flat      →  se > MAX_TYRES_OUT ruote fuori
+        """
+        speed_r = state["speed"] / 100.0 * W_SPEED
+        rpm_r   = (state["rpm"] / MAX_RPM_REF) * W_RPM
+        dist_p  = -(state["dist"] ** LINE_EXP) * W_LINE_PENALTY
+
+        reward = speed_r + rpm_r + dist_p
+
+        if state["tyres_out"] > MAX_TYRES_OUT:
+            reward += PENALTY_TYRES
+
+        return float(reward)
+
+    # ------------------------------------------------------------------
+    # Interfaccia Gymnasium
+    # ------------------------------------------------------------------
 
     def step(self, action):
-        self.gamepad.left_joystick_float(x_value_float=action[0], y_value_float=0.0)
-        self.gamepad.right_trigger_float(value_float=action[1])
-        self.gamepad.left_trigger_float(value_float=action[2])
+        # Applica i comandi al gamepad
+        self.gamepad.left_joystick_float(x_value_float=float(action[0]), y_value_float=0.0)
+        self.gamepad.right_trigger_float(value_float=float(action[1]))  # acceleratore
+        self.gamepad.left_trigger_float (value_float=float(action[2]))  # freno
         self.gamepad.update()
 
-        time.sleep(0.01)
-        tel = self._get_telemetry()
-        dist, _ = self.kdtree.query([tel['x'], tel['z']])
+        time.sleep(STEP_DELAY)
 
+        state  = self._read_state()
+        obs    = self._make_obs(state)
+        reward = self._compute_reward(state)
 
-        reward = (tel['speed'] / 30.0) - (dist ** 2)
-        obs = np.array([tel['speed'] / 250.0, dist / 10.0, tel['g_lat'], tel['g_long'], action[0]], dtype=np.float32)
+        # --- Condizioni di terminazione ---
+        terminated = False
 
-        return obs, reward, dist > 7.0, False, {}
+        if state["tyres_out"] > MAX_TYRES_OUT:
+            print(f"[RESET] {state['tyres_out']} ruote fuori | penalty={PENALTY_TYRES}")
+            terminated = True
+
+        if state["dist"] > MAX_DIST_RESET:
+            print(f"[RESET] Distanza dalla traiettoria: {state['dist']:.2f} m")
+            terminated = True
+
+        return obs, reward, terminated, False, state
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.gamepad.reset()
         self.gamepad.update()
-        return np.zeros(5, dtype=np.float32), {}
+        time.sleep(0.5)          # dai tempo al gioco di recepire il reset
+        state = self._read_state()
+        return self._make_obs(state), {}
+
+    def close(self):
+        self.asm.stop()
+        super().close()
 
 
-# --- LOGICA DI CARICAMENTO E SALVATAGGIO ---
+# ---------------------------------------------------------------------------
+# Entry point — Training
+# ---------------------------------------------------------------------------
+
 if __name__ == "__main__":
-    env = AssettoCorsaMultiTrackEnv()
+    env = AssettoCorsaEnv()
+
     model_name = f"model_{env.track_name}"
-    model_path = f"{model_name}.zip"
+    model_path = f"models/{model_name}.zip"
+    os.makedirs("models", exist_ok=True)
 
     if os.path.exists(model_path):
-        print(f">>> Trovato modello salvato per {env.track_name}. Caricamento in corso...")
+        print(f"[Main] Caricamento modello salvato: {model_path}")
         model = PPO.load(model_path, env=env)
     else:
-        print(f">>> Nessun salvataggio per {env.track_name}. Creazione nuovo modello...")
-        model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003)
+        print(f"[Main] Nuovo modello per: {env.track_name}")
+        model = PPO(
+            policy        = "MlpPolicy",
+            env           = env,
+            verbose       = 1,
+            learning_rate = 3e-4,
+            n_steps       = 2048,
+            batch_size    = 64,
+            gamma         = 0.99,
+            ent_coef      = 0.01,    # esplorazione
+            clip_range    = 0.2,
+        )
 
     try:
-        # Loop di apprendimento
-        model.learn(total_timesteps=1000000)
+        model.learn(total_timesteps=1_000_000)
     except KeyboardInterrupt:
-        print("\n[INTERRUZIONE] Salvataggio progressi...")
+        print("\n[Main] Interruzione manuale — salvataggio in corso...")
     finally:
-        model.save(model_name)
-        print(f">>> Modello {model_name} salvato correttamente.")
+        model.save(model_path)
+        env.close()
+        print(f"[Main] Modello salvato in: {model_path}")
