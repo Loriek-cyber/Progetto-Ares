@@ -8,140 +8,128 @@ from stable_baselines3 import PPO
 import gymnasium as gym
 from gymnasium import spaces
 
-# --- COSTANTI MEMORIA ASSETTO CORSA (SPageFilePhysics) ---
+# --- CONFIGURAZIONE MEMORIA AC ---
 AC_SM_PHYSICS = "Local\\AcTools.Physics"
 
 
-class AssettoCorsaEnv(gym.Env):
+class AssettoCorsaControllerEnv(gym.Env):
     def __init__(self, ai_path):
-        super(AssettoCorsaEnv, self).__init__()
+        super(AssettoCorsaControllerEnv, self).__init__()
 
-        # 1. Inizializzazione Joystick Virtuale (vJoy Device 1)
+        # 1. Init vJoy (Assicurati che il Device 1 sia attivo)
         try:
-            self.joystick = pyvjoy.VJoyDevice(1)
-            print(">>> vJoy Device 1 connesso con successo.")
+            self.vj = pyvjoy.VJoyDevice(1)
+            print(">>> vJoy Connesso (Modalità Controller)")
         except Exception as e:
-            print(f">>> ERRORE: Impossibile connettersi a vJoy. {e}")
+            print(f">>> Errore vJoy: {e}")
             exit()
 
-        # 2. Caricamento Traiettoria Monza (.ai file)
-        print(f">>> Caricamento traiettoria da: {ai_path}")
+        # 2. Caricamento Traiettoria
         self.ideal_line = self._parse_ai_file(ai_path)
-        # Usiamo X e Z per il piano della pista (Y è l'altezza)
         self.kdtree = KDTree(self.ideal_line[:, [0, 2]])
 
-        # 3. Definizione Spazi IA
-        # Action: [Sterzo (-1,1), Accel (0,1), Freno (0,1)]
+        # 3. Spazi IA
+        # Action: [Sterzo (-1,1), Gas (0,1), Freno (0,1)]
         self.action_space = spaces.Box(low=np.array([-1, 0, 0]), high=np.array([1, 1, 1]), dtype=np.float32)
-
-        # Observation: [Velocità, Errore Lat, G-Lat, G-Long, AngoloApprossimativo]
+        # Obs: [Velocità, Errore Lat, G-Lat, G-Long, Buffer_Sterzo]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
+
+        self.prev_steer = 0.0
 
     def _parse_ai_file(self, path):
         points = []
         with open(path, "rb") as f:
-            header = f.read(4)
-            num_points = struct.unpack('i', header)[0]
+            num_points = struct.unpack('i', f.read(4))[0]
             for _ in range(num_points):
-                # Ogni punto della spline AC è 28 byte (7 float)
                 data = struct.unpack('fffffff', f.read(28))
                 points.append(data)
         return np.array(points)
 
     def _get_telemetry(self):
         try:
-            # Accesso alla Shared Memory Physics
             shm = mmap.mmap(0, 800, AC_SM_PHYSICS, access=mmap.ACCESS_READ)
-
-            # Offset precisi documentazione AC:
-            # Speed (km/h) @ offset 28
+            # Lettura offset fisici
             speed = struct.unpack('f', shm[28:32])[0]
-
-            # G-Force (Lat, Long) @ offset 32, 40
             g_lat = struct.unpack('f', shm[32:36])[0]
             g_long = struct.unpack('f', shm[40:44])[0]
-
-            # Position X, Y, Z @ offset 60, 64, 68
             x = struct.unpack('f', shm[60:64])[0]
             z = struct.unpack('f', shm[68:72])[0]
-
             shm.close()
             return {"x": x, "z": z, "speed": speed, "g_lat": g_lat, "g_long": g_long}
-        except Exception:
-            # Se il gioco è chiuso o la memoria non è pronta, restituisci zeri
+        except:
             return {"x": 0, "z": 0, "speed": 0, "g_lat": 0, "g_long": 0}
 
     def step(self, action):
-        # --- 1. INVIO COMANDI A VJOY ---
-        # Mappatura: vJoy accetta valori interi da 0 a 32767
-        vjoy_steer = int((action[0] + 1) * 16383.5)
-        vjoy_accel = int(action[1] * 32767)
-        vjoy_brake = int(action[2] * 32767)
+        # --- FILTRO STERZO (Smoothing per Controller) ---
+        alpha = 0.3  # Più è basso, più lo sterzo è "morbido"
+        current_steer = (alpha * action[0]) + ((1 - alpha) * self.prev_steer)
+        self.prev_steer = current_steer
 
-        self.joystick.set_axis(pyvjoy.HID_USAGE_X, vjoy_steer)
-        self.joystick.set_axis(pyvjoy.HID_USAGE_Y, vjoy_accel)
-        self.joystick.set_axis(pyvjoy.HID_USAGE_Z, vjoy_brake)
+        # --- INVIO A VJOY ---
+        # Sterzo -> Asse X (0 a 32767, centro 16384)
+        self.vj.set_axis(pyvjoy.HID_USAGE_X, int((current_steer + 1) * 16383.5))
+        # Acceleratore -> Asse Z
+        self.vj.set_axis(pyvjoy.HID_USAGE_Z, int(action[1] * 32767))
+        # Freno -> Asse RX (Rotational X)
+        self.vj.set_axis(pyvjoy.HID_USAGE_RX, int(action[2] * 32767))
 
-        # Aspettiamo un minimo per la fisica del gioco
-        time.sleep(0.01)
+        time.sleep(0.02)  # Frequenza campionamento ~50Hz
 
-        # --- 2. LETTURA RISULTATI ---
+        # --- CALCOLO REWARD E OBS ---
         tel = self._get_telemetry()
         dist, _ = self.kdtree.query([tel['x'], tel['z']])
 
-        # --- 3. REWARD DESIGN ---
-        # Reward positiva per velocità, negativa per distanza dalla linea ideale
-        reward = (tel['speed'] / 50.0) - (dist * 2.0)
+        # Reward bilanciata: premia la velocità ma punisce severamente l'uscita di traiettoria
+        reward = (tel['speed'] / 40.0) - (dist * 2.5)
 
-        # Penalità per eccessive forze G laterali (opzionale, per guida fluida)
-        reward -= abs(tel['g_lat']) * 0.1
+        # Penalità se l'auto è ferma (per evitare che l'IA non parta mai)
+        if tel['speed'] < 5: reward -= 1.0
 
-        # --- 4. STATO E FINE SESSIONE ---
-        # Normalizziamo le osservazioni per la rete neurale
         obs = np.array([
-            tel['speed'] / 200.0,
-            dist / 5.0,
-            tel['g_lat'],
-            tel['g_long'],
-            0  # Placeholder per angolo
+            tel['speed'] / 250.0,
+            dist / 10.0,
+            tel['g_lat'] / 3.0,
+            tel['g_long'] / 3.0,
+            current_steer
         ], dtype=np.float32)
 
-        # Se l'auto esce di 8 metri dalla linea ideale, consideriamo il tentativo fallito
-        terminated = dist > 8.0
-        truncated = False
-
-        return obs, reward, terminated, truncated, {}
+        # Terminazione se l'auto esce troppo dalla linea ideale (es. 7 metri)
+        terminated = dist > 7.0
+        return obs, reward, terminated, False, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # Riporta i comandi a zero
-        self.joystick.set_axis(pyvjoy.HID_USAGE_X, 16384)
-        self.joystick.set_axis(pyvjoy.HID_USAGE_Y, 0)
-        self.joystick.set_axis(pyvjoy.HID_USAGE_Z, 0)
-
+        # Reset comandi
+        self.vj.set_axis(pyvjoy.HID_USAGE_X, 16384)
+        self.vj.set_axis(pyvjoy.HID_USAGE_Z, 0)
+        self.vj.set_axis(pyvjoy.HID_USAGE_RX, 0)
+        self.prev_steer = 0.0
         return np.zeros(5, dtype=np.float32), {}
 
 
-# --- AVVIO TRAINING ---
+# --- MAIN LOOP ---
 if __name__ == "__main__":
-    # Percorso del file AI (assicurati che sia corretto!)
     AI_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks/monza/ai/fast_lane.ai"
 
-    env = AssettoCorsaEnv(AI_PATH)
+    env = AssettoCorsaControllerEnv(AI_PATH)
 
-    # MLP (Multi-Layer Perceptron) è ottimo per dati vettoriali come questi
-    model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4, batch_size=64)
+    # Parametri PPO ottimizzati per stabilità
+    model = PPO("MlpPolicy", env,
+                verbose=1,
+                learning_rate=0.0003,
+                n_steps=2048,
+                batch_size=64,
+                ent_coef=0.01)  # ent_coef aiuta l'esplorazione
 
-    print("\n" + "=" * 50)
-    print(">>> IA PRONTA. CONFIGURA I CONTROLLI IN AC ORA!")
-    print(">>> L'IA sta inviando segnali vJoy. Mappa X=Steer, Y=Gas, Z=Brake.")
-    print(">>> PREMI CTRL+C PER FERMARE E SALVARE.")
-    print("=" * 50 + "\n")
+    print("\n>>> MODALITÀ CONTROLLER ATTIVA")
+    print(">>> 1. Vai in AC > Controls > Wheel")
+    print(">>> 2. Mappa Steer su X, Throttle su Z, Brake su RX")
+    print(">>> 3. Imposta i gradi di rotazione a 200°")
 
     try:
         model.learn(total_timesteps=1000000)
     except KeyboardInterrupt:
-        print("\n[STOP] Salvataggio in corso...")
+        print("\n[SALVATAGGIO] Modello interrotto...")
     finally:
-        model.save("monza_ai_driver")
-        print(">>> MODELLO SALVATO: monza_ai_driver.zip")
+        model.save("models/ac_controller_ai")
+        print(">>> Modello salvato: ac_controller_ai.zip")
