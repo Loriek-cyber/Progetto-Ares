@@ -32,7 +32,7 @@ BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
 # ---------------------------------------------------------------------------
 
 MAX_TYRES_OUT   = 3        # N° ruote fuori che scatena reset + penalità
-PENALTY_TYRES   = -15.0    # Penalità istantanea per troppe ruote fuori pista
+PENALTY_TYRES   = -1000.0    # Penalità istantanea per troppe ruote fuori pista
 MAX_DIST_RESET  = 6.0      # Distanza (m) dalla linea ideale che forza il reset
 MAX_RPM_REF     = 8500.0   # RPM massimi di riferimento per normalizzazione
 STEP_DELAY      = 0.005    # Secondi tra uno step e il successivo (basso = più veloce)
@@ -131,9 +131,11 @@ class AssettoCorsaEnv(gym.Env):
           - (dist^exp) * peso  →  penalità FORTE per deviazione dalla traiettoria
           - penalità flat      →  se > MAX_TYRES_OUT ruote fuori
         """
-        speed_r = state["speed"] / 100.0 * W_SPEED
+        speed_r = state["speed"] / 10.0 * W_SPEED
         rpm_r   = (state["rpm"] / MAX_RPM_REF) * W_RPM
         dist_p  = -(state["dist"] ** LINE_EXP) * W_LINE_PENALTY
+
+        print(dist_p)
 
         reward = speed_r + rpm_r + dist_p
 
