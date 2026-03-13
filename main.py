@@ -2,7 +2,7 @@ import mmap
 import struct
 import time
 import numpy as np
-import pyvjoy
+import vgamepad as vg
 from scipy.spatial import KDTree
 from stable_baselines3 import PPO
 import gymnasium as gym
@@ -12,26 +12,22 @@ from gymnasium import spaces
 AC_SM_PHYSICS = "Local\\AcTools.Physics"
 
 
-class AssettoCorsaControllerEnv(gym.Env):
+class AssettoCorsaViGEmEnv(gym.Env):
     def __init__(self, ai_path):
-        super(AssettoCorsaControllerEnv, self).__init__()
+        super(AssettoCorsaViGEmEnv, self).__init__()
 
-        # 1. Init vJoy (Assicurati che il Device 1 sia attivo)
-        try:
-            self.vj = pyvjoy.VJoyDevice(1)
-            print(">>> vJoy Connesso (Modalità Controller)")
-        except Exception as e:
-            print(f">>> Errore vJoy: {e}")
-            exit()
+        # 1. Inizializzazione Controller Xbox Virtuale
+        self.gamepad = vg.VX360Gamepad()
+        print(">>> Controller Xbox 360 Virtuale (ViGEm) inizializzato.")
 
         # 2. Caricamento Traiettoria
         self.ideal_line = self._parse_ai_file(ai_path)
         self.kdtree = KDTree(self.ideal_line[:, [0, 2]])
 
         # 3. Spazi IA
-        # Action: [Sterzo (-1,1), Gas (0,1), Freno (0,1)]
+        # Action: [Sterzo (-1 a 1), Gas (0 a 1), Freno (0 a 1)]
         self.action_space = spaces.Box(low=np.array([-1, 0, 0]), high=np.array([1, 1, 1]), dtype=np.float32)
-        # Obs: [Velocità, Errore Lat, G-Lat, G-Long, Buffer_Sterzo]
+        # Obs: [Velocità, Errore Lat, G-Lat, G-Long, Input_Sterzo_Precedente]
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
 
         self.prev_steer = 0.0
@@ -48,7 +44,6 @@ class AssettoCorsaControllerEnv(gym.Env):
     def _get_telemetry(self):
         try:
             shm = mmap.mmap(0, 800, AC_SM_PHYSICS, access=mmap.ACCESS_READ)
-            # Lettura offset fisici
             speed = struct.unpack('f', shm[28:32])[0]
             g_lat = struct.unpack('f', shm[32:36])[0]
             g_long = struct.unpack('f', shm[40:44])[0]
@@ -60,76 +55,70 @@ class AssettoCorsaControllerEnv(gym.Env):
             return {"x": 0, "z": 0, "speed": 0, "g_lat": 0, "g_long": 0}
 
     def step(self, action):
-        # --- FILTRO STERZO (Smoothing per Controller) ---
-        alpha = 0.3  # Più è basso, più lo sterzo è "morbido"
-        current_steer = (alpha * action[0]) + ((1 - alpha) * self.prev_steer)
-        self.prev_steer = current_steer
+        # --- INPUT CONTROLLER XBOX ---
+        # Sterzo: Stick Sinistro (X_AXIS: da -1.0 a 1.0)
+        self.gamepad.left_joystick_float(x_value_float=action[0], y_value_float=0.0)
 
-        # --- INVIO A VJOY ---
-        # Sterzo -> Asse X (0 a 32767, centro 16384)
-        self.vj.set_axis(pyvjoy.HID_USAGE_X, int((current_steer + 1) * 16383.5))
-        # Acceleratore -> Asse Z
-        self.vj.set_axis(pyvjoy.HID_USAGE_Z, int(action[1] * 32767))
-        # Freno -> Asse RX (Rotational X)
-        self.vj.set_axis(pyvjoy.HID_USAGE_RX, int(action[2] * 32767))
+        # Acceleratore: Trigger Destro (da 0.0 a 1.0)
+        self.gamepad.right_trigger_float(value_float=action[1])
 
-        time.sleep(0.02)  # Frequenza campionamento ~50Hz
+        # Freno: Trigger Sinistro (da 0.0 a 1.0)
+        self.gamepad.left_trigger_float(value_float=action[2])
 
-        # --- CALCOLO REWARD E OBS ---
+        # Applica i cambiamenti
+        self.gamepad.update()
+
+        # Tempo di campionamento
+        time.sleep(0.01)
+
+        # --- TELEMETRIA E REWARD ---
         tel = self._get_telemetry()
         dist, _ = self.kdtree.query([tel['x'], tel['z']])
 
-        # Reward bilanciata: premia la velocità ma punisce severamente l'uscita di traiettoria
-        reward = (tel['speed'] / 40.0) - (dist * 2.5)
+        # Reward: penalizziamo l'errore laterale in modo esponenziale
+        reward = (tel['speed'] / 30.0) - (dist ** 2)
 
-        # Penalità se l'auto è ferma (per evitare che l'IA non parta mai)
-        if tel['speed'] < 5: reward -= 1.0
+        # Bonus per velocità minima (non restare fermi)
+        if tel['speed'] < 10: reward -= 2.0
 
         obs = np.array([
             tel['speed'] / 250.0,
             dist / 10.0,
-            tel['g_lat'] / 3.0,
-            tel['g_long'] / 3.0,
-            current_steer
+            tel['g_lat'],
+            tel['g_long'],
+            action[0]
         ], dtype=np.float32)
 
-        # Terminazione se l'auto esce troppo dalla linea ideale (es. 7 metri)
+        # Reset se l'auto vola fuori pista (7 metri)
         terminated = dist > 7.0
         return obs, reward, terminated, False, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # Reset comandi
-        self.vj.set_axis(pyvjoy.HID_USAGE_X, 16384)
-        self.vj.set_axis(pyvjoy.HID_USAGE_Z, 0)
-        self.vj.set_axis(pyvjoy.HID_USAGE_RX, 0)
-        self.prev_steer = 0.0
+        # Reset controller
+        self.gamepad.reset()
+        self.gamepad.update()
         return np.zeros(5, dtype=np.float32), {}
 
 
-# --- MAIN LOOP ---
+# --- TRAINING ---
 if __name__ == "__main__":
     AI_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks/monza/ai/fast_lane.ai"
+    env = AssettoCorsaViGEmEnv(AI_PATH)
 
-    env = AssettoCorsaControllerEnv(AI_PATH)
+    # PPO è robusto per il controllo continuo
+    model = PPO("MlpPolicy", env, verbose=1, learning_rate=0.0003, n_steps=5000)
 
-    # Parametri PPO ottimizzati per stabilità
-    model = PPO("MlpPolicy", env,
-                verbose=1,
-                learning_rate=0.0003,
-                n_steps=2048,
-                batch_size=64,
-                ent_coef=0.01)  # ent_coef aiuta l'esplorazione
-
-    print("\n>>> MODALITÀ CONTROLLER ATTIVA")
-    print(">>> 1. Vai in AC > Controls > Wheel")
-    print(">>> 2. Mappa Steer su X, Throttle su Z, Brake su RX")
-    print(">>> 3. Imposta i gradi di rotazione a 200°")
+    print("\n" + "=" * 50)
+    print(">>> CONTROLLER XBOX VIRTUALE ATTIVO.")
+    print(">>> In Assetto Corsa, vai in 'Controls' e seleziona 'Gamepad'.")
+    print(">>> Verifica che gli indicatori si muovano!")
+    print("=" * 50 + "\n")
 
     try:
         model.learn(total_timesteps=1000000)
     except KeyboardInterrupt:
-        print("\n[SALVATAGGIO] Modello interrotto...")
+        print("\n[STOP] Salvataggio modello...")
     finally:
-        model.save("models/ac_controller_ai")
-        print(">>> Modello salvato: ac_controller_ai.zip")
+        model.save("models/ac_vigem_ai")
+        print(">>> Modello salvato come: ac_vige_ai.zip")
