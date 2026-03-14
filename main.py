@@ -294,7 +294,7 @@ class AssettoCorsaEnv(gym.Env):
 
         if state["tyres_out"] >= MAX_TYRES_OUT:
             reward += PENALTY_TYRES
-        print(reward)
+        
         return float(reward)
 
     # ------------------------------------------------------------------
@@ -372,26 +372,48 @@ class AssettoCorsaEnv(gym.Env):
 
 
 # ---------------------------------------------------------------------------
-# Entry point — Training
+# Entry point — Fine-tuning su AC reale
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     env = AssettoCorsaEnv()
 
-    model_name = f"model_{env.track_name}"
-    model_path = f"models/{model_name}.zip"
+    track        = env.track_name
+    model_name   = f"model_{track}"
+    model_path   = f"models/{model_name}.zip"
+
+    # Percorsi modelli dal simulatore
+    sim_best_path = f"models_sim/ppo_sim_{track}_best/best_model.zip"
+    sim_path      = f"models_sim/ppo_sim_{track}.zip"
+
     os.makedirs("models", exist_ok=True)
 
     if os.path.exists(model_path):
-        print(f"[Main] Caricamento modello: {model_path}")
+        # 1) Fine-tuning modello AC reale già esistente
+        print(f"[Main] Caricamento modello AC reale: {model_path}")
         model = PPO.load(model_path, env=env)
+
+    elif os.path.exists(sim_best_path):
+        # 2) Trasferimento dal BEST model del simulatore
+        print(f"[Main] Caricamento best model simulatore: {sim_best_path}")
+        print(f"[Main] Fine-tuning su AC reale...")
+        model = PPO.load(sim_best_path, env=env)
+
+    elif os.path.exists(sim_path):
+        # 3) Trasferimento dal checkpoint finale del simulatore
+        print(f"[Main] Caricamento modello simulatore: {sim_path}")
+        print(f"[Main] Fine-tuning su AC reale...")
+        model = PPO.load(sim_path, env=env)
+
     else:
-        print(f"[Main] Nuovo modello per: {env.track_name}")
+        # 4) Nessun modello disponibile — training da zero
+        print(f"[Main] Nessun modello trovato — training da zero per: {track}")
+        print(f"[Main] Suggerimento: esegui prima 'python train_sim.py' per pre-addestrare nel simulatore")
         model = PPO(
             policy        = "MlpPolicy",
             env           = env,
             verbose       = 0,
-            learning_rate = 3e-4,
+            learning_rate = 3e-3,
             n_steps       = 2048,
             batch_size    = 64,
             gamma         = 0.99,

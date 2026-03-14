@@ -31,7 +31,7 @@ from sim.sim_env import SimACEnv
 # Configurazione
 # ---------------------------------------------------------------------------
 
-N_ENVS         = 16          # numero di ambienti paralleli (scalabile)
+N_ENVS         = 16        # numero di ambienti paralleli (scalabile)
 TOTAL_STEPS    = 10_000_000  # step totali di training
 CHECKPOINT_FREQ = 100_000    # salva modello ogni N step (per env)
 EVAL_FREQ      = 50_000      # valutazione ogni N step (per env)
@@ -53,7 +53,7 @@ except ImportError:
 
 # Hyperparametri PPO ottimizzati per questo task
 PPO_PARAMS = dict(
-    learning_rate   = 3e-4,
+    learning_rate   = 3e-3,
     n_steps         = 2048,    # step per env per ogni update
     batch_size      = 512,     # batch size (deve dividere n_steps * n_envs)
     n_epochs        = 10,
@@ -63,7 +63,7 @@ PPO_PARAMS = dict(
     ent_coef        = 0.005,   # bassa entropia → sfruttamento
     vf_coef         = 0.5,
     max_grad_norm   = 0.5,
-    verbose         = 1,
+    verbose         = 0,
     tensorboard_log = _TB_LOG,
 )
 
