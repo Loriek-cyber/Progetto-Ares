@@ -428,6 +428,8 @@ def send_reset_to_ac(delay: float = 0.3) -> None:
         import time as _t
         _t.sleep(delay)                          # attendi che si apra il menu
         pyautogui.click(*AC_RESTART_CLICK_POS)
+        pyautogui.click(*AC_RESTART_CLICK_POS)
+        pyautogui.click(*AC_RESTART_CLICK_POS)
         print(f"[Driver] Click restart @ {AC_RESTART_CLICK_POS}")
 
 if __name__ == '__main__':

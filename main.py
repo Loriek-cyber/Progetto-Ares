@@ -1,11 +1,21 @@
 """
-main.py — Ambiente RL per Assetto Corsa
-Logica pura: Env Gymnasium + Training PPO.
+main.py - Ambiente RL per Assetto Corsa (Fase 1 - Segui la linea)
+=================================================================
+ARCHITETTURA:
+  - L'agente controlla gas, freno E sterzo (action space 3D)
+  - Un controller PD calcola la correzione ideale dello sterzo (pd_steer)
+    basata sull'heading error (angolo auto vs tangente della AI line)
+  - Lo sterzo finale e' un blend fra quello dell'agente e quello del PD:
+      * fuori pista / bordo pista  → il PD prende il controllo
+      * in pista e heading ok      → l'agente controlla liberamente
+  - L'obiettivo e' far seguire la traiettoria ideale con velocita' ottimale
+
 Tutti i dati vengono letti tramite utils.driver.
 """
 
 import os
 import time
+import math
 
 import numpy as np
 import vgamepad as vg
@@ -30,30 +40,44 @@ from utils.driver import (
 BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
 
 # ---------------------------------------------------------------------------
-# Parametri di training — modifica qui per fare tuning
+# Parametri di training
 # ---------------------------------------------------------------------------
 
-MAX_TYRES_OUT   = 3          # N° ruote fuori che scatena reset + penalità
-PENALTY_TYRES   = -2000.0   # Penalità istantanea per troppe ruote fuori pista
-MAX_DIST_RESET  = 6.0        # Distanza (m) dalla linea ideale che forza il reset
-MAX_RPM_REF     = 8500.0     # RPM massimi di riferimento per normalizzazione
-STEP_DELAY      = 0.001      # Secondi tra uno step e il successivo
+MAX_TYRES_OUT  = 3         # ruote fuori che scatena reset (>= 3)
+PENALTY_TYRES  = -200.0   # penalita' piatta per uscita pista
+CAR_DAMAGE_MAX = 1         # soglia danno carrozzeria per reset
+MAX_DIST_RESET = 6.0       # distanza (m) dalla linea che forza reset
+MAX_RPM_REF    = 8500.0    # RPM max di riferimento
+STEP_DELAY     = 0.001     # secondi tra step
 
-# Pesi del reward principale
-W_SPEED         = 1.2        # Premia la velocità
-W_RPM           = 0.8        # Premia RPM alti
-W_LINE_PENALTY  = 4.0        # Penalizza la deviazione dalla linea ideale
-LINE_EXP        = 2.5        # Esponente penalità distanza (>2 = aggressivo)
+# --- Controller PD per la correzione di sicurezza dello sterzo ---
+# heading_error (rad) → steer_correction [-1, 1]
+# steer = Kp * err + Kd * (err - prev_err)
+STEER_KP       = 0.4       # guadagno proporzionale
+STEER_KD       = 0.15      # guadagno derivativo (smorzamento oscillazioni)
+STEER_MAX      = 1.0       # saturazione uscita PD
 
-# Pesi reward checkpoint / corner braking
-W_PROGRESS      = 5.0        # Moltiplica il reward di avanzamento checkpoint
-W_BACKTRACK     = 3.0        # Moltiplica la penalità di retrocessione
-W_BRAKING       = 6.0        # Penalità per entrare troppo veloce in curva
-CORNER_DIST_REF = 200.0      # Distanza di riferimento per normalizzazione curva (m)
+# --- Safety blend: quanto il PD sovrascrive l'agente ---
+# blend_factor = 0.0 → agente controlla tutto
+# blend_factor = 1.0 → PD controlla tutto (override pieno)
+# La blend cresce linearmente con dist_norm e |heading_err|
+STEER_BLEND_DIST_START = 0.4   # dist/MAX_DIST_RESET oltre cui inizia il blend (40% della zona pericolosa)
+STEER_BLEND_DIST_FULL  = 0.85  # dist/MAX_DIST_RESET a cui il PD prende il pieno controllo
+STEER_BLEND_HEAD_START = 0.35  # |heading_err|/pi oltre cui l'heading contribuisce al blend
+STEER_BLEND_HEAD_FULL  = 0.75  # |heading_err|/pi a cui il PD prende il pieno controllo
 
-# Decellerazione fisica massima ragionevole per calcolo braking (m/s²)
-MAX_BRAKE_DECEL = 18.0       # ~1.8g di frenata massima
-CAR_DAMAGE_MAX = 1
+# --- Pesi reward ---
+W_SPEED        = 1.0       # premia velocita' alta
+W_RPM          = 0.6       # premia RPM alti
+W_PROGRESS     = 6.0       # premia avanzamento checkpoint
+W_BACKTRACK    = 6.0       # penaliza retromarcia
+W_LINE         = 10.0      # penaliza distanza dalla linea
+LINE_EXP       = 2.5       # esponente penalita' linea
+W_HEADING      = 5.0       # penaliza heading error (auto non punta nella dir. giusta)
+W_BRAKING      = 5.0       # penaliza entrata troppo veloce in curva
+MAX_BRAKE_DECEL= 18.0      # m/s^2 — limite fisico frenata
+CORNER_DIST_REF= 200.0     # m ref per normalizzazione curva
+
 
 # ---------------------------------------------------------------------------
 # Ambiente Gymnasium
@@ -61,24 +85,27 @@ CAR_DAMAGE_MAX = 1
 
 class AssettoCorsaEnv(gym.Env):
     """
-    Ambiente Gymnasium per Assetto Corsa con sistema a checkpoint e corner braking.
+    Ambiente Fase 1 — Segui la traiettoria.
 
     Observation (10,):
-      [0] speed_norm          velocità normalizzata (0..1)
-      [1] dist_norm           distanza dalla linea ideale normalizzata
-      [2] g_lat               accelerazione laterale (g)
-      [3] g_long              accelerazione longitudinale (g)
-      [4] steer_norm          sterzo normalizzato (-1..1)
-      [5] rpm_norm            RPM normalizzati (0..1)
-      [6] tyres_out_norm      ruote fuori (0..1)
-      [7] corner_dist_norm    distanza alla prossima curva normalizzata (0..1)
-      [8] corner_speed_norm   velocità target alla curva normalizzata (0..1)
-      [9] speed_excess_norm   eccesso di velocità rispetto al braking point (0..1+)
+      [0] speed_norm         velocita' normalizzata     (0..1)
+      [1] dist_norm          distanza dalla linea        (0..1+)
+      [2] g_lat              accelerazione laterale      (g)
+      [3] g_long             accelerazione longitudinale (g)
+      [4] rpm_norm           RPM normalizzati            (0..1)
+      [5] tyres_out_norm     ruote fuori                 (0..1)
+      [6] heading_err_norm   heading error normalizzato  (-1..1)
+      [7] corner_dist_norm   distanza prossima curva     (0..1)
+      [8] speed_excess_norm  eccesso vel rispetto curva  (0..3)
+      [9] blend_factor       quanto il PD sta correggendo(0..1)
 
     Action (3,):
-      [0] steer      ∈ [-1, 1]
-      [1] throttle   ∈ [ 0, 1]
-      [2] brake      ∈ [ 0, 1]
+      [0] throttle  in [0, 1]
+      [1] brake     in [0, 1]
+      [2] steer     in [-1, 1]  (controllato dall'agente, con safety blend PD)
+
+    Il sistema applica un safety blend: se l'auto si avvicina al bordo o
+    ha un alto heading error, il PD sovrascrive gradualmente lo sterzo dell'agente.
     """
 
     metadata = {"render_modes": []}
@@ -93,7 +120,7 @@ class AssettoCorsaEnv(gym.Env):
         self.asm = AssettoCorsaData()
         self.asm.start()
 
-        # --- Pista e linea ideale ---
+        # --- Pista ---
         self.track_name = get_track_name()
         print(f"[Env] Pista rilevata: {self.track_name}")
 
@@ -101,77 +128,131 @@ class AssettoCorsaEnv(gym.Env):
         if not os.path.exists(ai_path):
             raise FileNotFoundError(f"File AI non trovato: {ai_path}")
 
-        self.ai_line   = load_ai_line(ai_path)
-        self.kdtree    = build_kdtree(self.ai_line)
+        self.ai_line    = load_ai_line(ai_path)
+        self.kdtree     = build_kdtree(self.ai_line)
         self.checkpoints = CheckpointSystem(self.ai_line, self.kdtree)
 
-        # --- Spazi ---
+        # --- Stato PD controller ---
+        self._prev_heading_err = 0.0   # per termine derivativo
+
+        # --- Spazi RL ---
         self.action_space = spaces.Box(
-            low  = np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-            high = np.array([ 1.0, 1.0, 1.0], dtype=np.float32),
+            low  = np.array([0.0, 0.0, -1.0], dtype=np.float32),
+            high = np.array([1.0, 1.0,  1.0], dtype=np.float32),
         )
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
         )
 
     # ------------------------------------------------------------------
+    # Controller PD (correzione di sicurezza sterzo)
+    # ------------------------------------------------------------------
+
+    def _compute_pd_steer(self, heading_err: float) -> float:
+        """
+        Calcola la correzione PD ideale [-1, 1] basata sull'heading error.
+        Questo valore viene usato solo come correzione di sicurezza, non
+        come comando diretto.
+
+        heading_err > 0  → auto punta a sinistra della traiettoria → sterza a destra
+        heading_err < 0  → auto punta a destra della traiettoria   → sterza a sinistra
+        """
+        p_term = STEER_KP * heading_err
+        d_term = STEER_KD * (heading_err - self._prev_heading_err)
+        self._prev_heading_err = heading_err
+
+        return float(np.clip(p_term + d_term, -STEER_MAX, STEER_MAX))
+
+    def _apply_safety_blend(self, agent_steer: float, pd_steer: float,
+                            dist: float, heading_err: float) -> tuple[float, float]:
+        """
+        Combina lo sterzo dell'agente con la correzione PD.
+        Ritorna (steer_finale, blend_factor).
+
+        blend_factor = 0  → agente controlla tutto
+        blend_factor = 1  → PD sovrascrive completamente
+        """
+        # Contributo distanza dalla linea
+        dist_norm = dist / MAX_DIST_RESET
+        blend_dist = float(np.clip(
+            (dist_norm - STEER_BLEND_DIST_START) /
+            (STEER_BLEND_DIST_FULL - STEER_BLEND_DIST_START),
+            0.0, 1.0
+        ))
+
+        # Contributo heading error
+        head_norm = abs(heading_err) / math.pi
+        blend_head = float(np.clip(
+            (head_norm - STEER_BLEND_HEAD_START) /
+            (STEER_BLEND_HEAD_FULL - STEER_BLEND_HEAD_START),
+            0.0, 1.0
+        ))
+
+        # Prendi il blend_factor maggiore tra i due contributi
+        blend_factor = max(blend_dist, blend_head)
+
+        steer_final = (1.0 - blend_factor) * agent_steer + blend_factor * pd_steer
+        steer_final = float(np.clip(steer_final, -1.0, 1.0))
+        return steer_final, blend_factor
+
+    # ------------------------------------------------------------------
     # Lettura stato
     # ------------------------------------------------------------------
 
     def _read_state(self) -> dict:
-        """Legge telemetria, posizione e info checkpoint. Ritorna stato grezzo."""
+        """Legge telemetria + posizione + checkpoint info."""
         self.asm.update()
-
-        x, z = get_car_position()
-
-        # KDTree query per distanza dalla linea ideale
+        x, z   = get_car_position()
         dist, _ = self.kdtree.query([x, z])
-
-        # Aggiorna sistema checkpoint (avanzamento + rilevamento curva)
         cp_info = self.checkpoints.update(x, z)
 
+        # Heading error: differenza angolare auto vs tangente AI line
+        # Entrambi in radianti, wrap in [-pi, pi]
+        raw_err = self.asm.heading - cp_info["ideal_heading_rad"]
+        heading_err = (raw_err + math.pi) % (2 * math.pi) - math.pi
+
         return {
-            "speed"           : self.asm.speed,       # km/h
-            "rpm"             : self.asm.rpm,
-            "steer"           : self.asm.steerAngle,  # gradi
-            "g_lat"           : self.asm.accGX,
-            "g_long"          : self.asm.accGY,
-            "tyres_out"       : self.asm.tyres_out,   # int 0..4
-            "car_damage"      : self.asm.car_damage_total,  # somma danni carrozzeria
-            "dist"            : float(dist),           # m dalla linea
-            "progress_reward" : cp_info["progress_reward"],
+            "speed"            : float(self.asm.speed),
+            "rpm"              : float(self.asm.rpm),
+            "g_lat"            : float(self.asm.accGX),
+            "g_long"           : float(self.asm.accGY),
+            "tyres_out"        : int(self.asm.tyres_out),
+            "car_damage"       : float(self.asm.car_damage_total),
+            "dist"             : float(dist),
+            "heading_err"      : heading_err,         # rad [-pi, pi]
+            "ideal_heading_rad": cp_info["ideal_heading_rad"],
+            "progress_reward"  : cp_info["progress_reward"],
             "backtrack_penalty": cp_info["backtrack_penalty"],
-            "checkpoint_hit"  : cp_info["checkpoint_hit"],
-            "corner_dist_m"   : cp_info["corner_dist_m"],   # m alla prossima curva
-            "corner_speed"    : cp_info["corner_speed"],     # km/h target alla curva
+            "checkpoint_hit"   : cp_info["checkpoint_hit"],
+            "corner_dist_m"    : cp_info["corner_dist_m"],
+            "corner_speed"     : cp_info["corner_speed"],
         }
 
-    def _make_obs(self, state: dict) -> np.ndarray:
-        """Costruisce il vettore di osservazione normalizzato (10,)."""
-        speed_ms       = state["speed"] / 3.6         # km/h → m/s
-        corner_speed_ms = state["corner_speed"] / 3.6
+    # ------------------------------------------------------------------
+    # Observation
+    # ------------------------------------------------------------------
 
-        # Calcolo eccesso di velocità rispetto al braking point:
-        # Per frenare da v_now a v_corner in dist_corner metri servono
-        # a = (v_now² - v_corner²) / (2 * dist_corner)
-        # Se a > MAX_BRAKE_DECEL → stai entrando troppo forte in curva
-        d = max(state["corner_dist_m"], 1.0)  # evita divisione per 0
-        required_decel = max(
+    def _make_obs(self, state: dict) -> np.ndarray:
+        speed_ms        = state["speed"] / 3.6
+        corner_speed_ms = state["corner_speed"] / 3.6
+        d               = max(state["corner_dist_m"], 1.0)
+
+        required_decel  = max(
             (speed_ms**2 - corner_speed_ms**2) / (2.0 * d), 0.0
         )
-        speed_excess = required_decel / MAX_BRAKE_DECEL  # 0 = ok, >1 = missile
+        speed_excess = required_decel / MAX_BRAKE_DECEL
 
         return np.array([
-            state["speed"]      / 300.0,           # [0] speed_norm
-            state["dist"]       / MAX_DIST_RESET,  # [1] dist_norm
-            state["g_lat"],                         # [2] g_lat
-            state["g_long"],                        # [3] g_long
-            state["steer"]      / 180.0,            # [4] steer_norm
-            state["rpm"]        / MAX_RPM_REF,      # [5] rpm_norm
-            state["tyres_out"]  / 4.0,              # [6] tyres_out_norm
+            state["speed"]        / 300.0,             # [0] speed_norm
+            state["dist"]         / MAX_DIST_RESET,    # [1] dist_norm
+            state["g_lat"],                             # [2] g_lat
+            state["g_long"],                            # [3] g_long
+            state["rpm"]          / MAX_RPM_REF,        # [4] rpm_norm
+            state["tyres_out"]    / 4.0,               # [5] tyres_out_norm
+            float(np.clip(state["heading_err"] / math.pi, -1.0, 1.0)),  # [6] heading_err
             state["corner_dist_m"] / CORNER_DIST_REF,  # [7] corner_dist_norm
-            state["corner_speed"]  / 300.0,         # [8] corner_speed_norm
-            np.clip(speed_excess, 0.0, 3.0),        # [9] speed_excess_norm
+            float(np.clip(speed_excess, 0.0, 3.0)),    # [8] speed_excess_norm
+            state.get("blend_factor", 0.0),            # [9] blend_factor (quanto il PD sta intervenendo)
         ], dtype=np.float32)
 
     # ------------------------------------------------------------------
@@ -180,43 +261,34 @@ class AssettoCorsaEnv(gym.Env):
 
     def _compute_reward(self, state: dict) -> float:
         """
-        Reward shaping completo:
-          + velocità alta          → incentiva spingere forte
-          + RPM alti               → incentiva gear alto
-          + progresso checkpoint   → segui la traiettoria in avanti
-          - penalità linea         → non uscire dalla traiettoria
-          - backtrack              → non tornare indietro
-          - braking penalty        → rallenta prima delle curve
-          - tyres out              → non uscire dalla pista
+        Reward Phase 1 — focus su: seguire la linea + velocita' giusta + direzione corretta.
         """
-        speed_ms       = state["speed"] / 3.6
+        speed_ms        = state["speed"] / 3.6
         corner_speed_ms = state["corner_speed"] / 3.6
-        d              = max(state["corner_dist_m"], 1.0)
+        d               = max(state["corner_dist_m"], 1.0)
 
-        # --- Componenti positivi ---
+        # Positivi
         speed_r    = state["speed"] / 10.0 * W_SPEED
         rpm_r      = (state["rpm"] / MAX_RPM_REF) * W_RPM
         progress_r = state["progress_reward"] * W_PROGRESS
 
-        # --- Componenti negativi ---
-        dist_p      = -(state["dist"] ** LINE_EXP) * W_LINE_PENALTY
+        # Negativi — linea
+        dist_p      = -(state["dist"] ** LINE_EXP) * W_LINE
         backtrack_p = state["backtrack_penalty"] * W_BACKTRACK
 
-        # Penalità braking: quanto stai eccedendo la decelerazione fisica massima
+        # Negativi — heading error (penalizza deviation angolare)
+        heading_p = -(state["heading_err"] ** 2) * W_HEADING
+
+        # Negativi — braking (entrata curva troppo veloce)
         required_decel = max(
             (speed_ms**2 - corner_speed_ms**2) / (2.0 * d), 0.0
         )
         speed_excess = required_decel / MAX_BRAKE_DECEL
-        # Penalità graduata: entra solo quando >0.5, cresce esponenzialmente
-        if speed_excess > 0.5:
-            braking_p = -((speed_excess - 0.5) ** 2) * W_BRAKING
-        else:
-            braking_p = 0.0
+        braking_p = -max((speed_excess - 0.5), 0.0) ** 2 * W_BRAKING
 
-        reward = speed_r + rpm_r + progress_r + dist_p + backtrack_p + braking_p
+        reward = speed_r + rpm_r + progress_r + dist_p + backtrack_p + heading_p + braking_p
 
-        # --- Penalità piatta per uscita di pista ---
-        if state["tyres_out"] > MAX_TYRES_OUT:
+        if state["tyres_out"] >= MAX_TYRES_OUT:
             reward += PENALTY_TYRES
 
         return float(reward)
@@ -226,40 +298,56 @@ class AssettoCorsaEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def step(self, action):
-        self.gamepad.left_joystick_float(x_value_float=float(action[0]), y_value_float=0.0)
-        self.gamepad.right_trigger_float(value_float=float(action[1]))  # gas
-        self.gamepad.left_trigger_float(value_float=float(action[2]))   # freno
+        # --- Leggi heading error PRIMA di applicare l'azione ---
+        self.asm.update()
+        x, z = get_car_position()
+        cp_info_pre = self.checkpoints.update(x, z)
+        raw_err = self.asm.heading - cp_info_pre["ideal_heading_rad"]
+        heading_err_pre = (raw_err + math.pi) % (2 * math.pi) - math.pi
+
+        # --- Sterzo: agente + safety blend PD ---
+        dist_pre, _ = self.kdtree.query([x, z])
+        agent_steer  = float(np.clip(action[2], -1.0, 1.0))   # sterzo dell'agente
+        pd_steer     = self._compute_pd_steer(heading_err_pre) # correzione PD
+        steer_val, blend_factor = self._apply_safety_blend(
+            agent_steer, pd_steer, dist_pre, heading_err_pre
+        )
+
+        # --- Applica comandi ---
+        self.gamepad.left_joystick_float(x_value_float=steer_val, y_value_float=0.0)
+        self.gamepad.right_trigger_float(value_float=float(action[0]))   # gas
+        self.gamepad.left_trigger_float(value_float=float(action[1]))    # freno
         self.gamepad.update()
 
         time.sleep(STEP_DELAY)
 
+        # --- Leggi stato post-azione ---
         state  = self._read_state()
+        state["blend_factor"] = blend_factor   # aggiunge il blend_factor allo stato
         obs    = self._make_obs(state)
         reward = self._compute_reward(state)
 
-        # --- Log di debug ---
+        # --- Log checkpoint ---
         if state["checkpoint_hit"]:
-            print(f"[CP] Checkpoint! reward_progress={state['progress_reward']:.3f} "
-                  f"| corner_in={state['corner_dist_m']:.0f}m "
-                  f"@ {state['corner_speed']:.0f}km/h")
+            print(f"[CP] +checkpoint | steer={steer_val:+.3f} "
+                  f"(agent={agent_steer:+.3f}, pd={pd_steer:+.3f}, blend={blend_factor:.2f}) | "
+                  f"herr={math.degrees(state['heading_err']):+.1f}deg | "
+                  f"corner={state['corner_dist_m']:.0f}m@{state['corner_speed']:.0f}km/h")
 
         # --- Condizioni di terminazione ---
         terminated = False
-
         if state["tyres_out"] >= MAX_TYRES_OUT:
-            print(f"[RESET] {state['tyres_out']} ruote fuori pista")
+            print(f"[RESET] {state['tyres_out']} ruote fuori | steer={steer_val:+.3f} (blend={blend_factor:.2f})")
             terminated = True
-
         if state["car_damage"] >= CAR_DAMAGE_MAX:
-            print(f"[RESET] Danno carrozzeria: {state['car_damage']:.1f}")
+            print(f"[RESET] Danno: {state['car_damage']:.1f}")
             terminated = True
-
         if state["dist"] > MAX_DIST_RESET:
-            print(f"[RESET] Distanza traiettoria: {state['dist']:.2f} m")
+            print(f"[RESET] Dist: {state['dist']:.2f}m")
             terminated = True
 
         if terminated:
-            send_reset_to_ac()   # Ctrl+R in game
+            send_reset_to_ac(2)
 
         return obs, reward, terminated, False, state
 
@@ -268,8 +356,10 @@ class AssettoCorsaEnv(gym.Env):
         self.gamepad.reset()
         self.gamepad.update()
         self.checkpoints.reset()
+        self._prev_heading_err = 0.0   # resetta termine derivativo PD
         time.sleep(0.5)
         state = self._read_state()
+        state["blend_factor"] = 0.0
         return self._make_obs(state), {}
 
     def close(self):
@@ -289,14 +379,14 @@ if __name__ == "__main__":
     os.makedirs("models", exist_ok=True)
 
     if os.path.exists(model_path):
-        print(f"[Main] Caricamento modello salvato: {model_path}")
+        print(f"[Main] Caricamento modello: {model_path}")
         model = PPO.load(model_path, env=env)
     else:
         print(f"[Main] Nuovo modello per: {env.track_name}")
         model = PPO(
             policy        = "MlpPolicy",
             env           = env,
-            verbose       = 1,
+            verbose       = 0,
             learning_rate = 3e-4,
             n_steps       = 2048,
             batch_size    = 64,
@@ -308,8 +398,8 @@ if __name__ == "__main__":
     try:
         model.learn(total_timesteps=1_000_000)
     except KeyboardInterrupt:
-        print("\n[Main] Interruzione manuale — salvataggio in corso...")
+        print("\n[Main] Interruzione — salvataggio...")
     finally:
         model.save(model_path)
         env.close()
-        print(f"[Main] Modello salvato in: {model_path}")
+        print(f"[Main] Modello salvato: {model_path}")
