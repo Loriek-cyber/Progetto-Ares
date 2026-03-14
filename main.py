@@ -46,7 +46,7 @@ BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
 MAX_TYRES_OUT  = 3         # ruote fuori che scatena reset (>= 3)
 PENALTY_TYRES  = -200.0   # penalita' piatta per uscita pista
 CAR_DAMAGE_MAX = 1         # soglia danno carrozzeria per reset
-MAX_DIST_RESET = 6.0       # distanza (m) dalla linea che forza reset
+MAX_DIST_RESET = 800       # distanza (m) dalla linea che forza reset
 MAX_RPM_REF    = 8500.0    # RPM max di riferimento
 STEP_DELAY     = 0.001     # secondi tra step
 
@@ -67,11 +67,11 @@ STEER_BLEND_HEAD_START = 0.35  # |heading_err|/pi oltre cui l'heading contribuis
 STEER_BLEND_HEAD_FULL  = 0.75  # |heading_err|/pi a cui il PD prende il pieno controllo
 
 # --- Pesi reward ---
-W_SPEED        = 1.0       # premia velocita' alta
+W_SPEED        = 1.6     # premia velocita' alta
 W_RPM          = 0.6       # premia RPM alti
 W_PROGRESS     = 6.0       # premia avanzamento checkpoint
 W_BACKTRACK    = 6.0       # penaliza retromarcia
-W_LINE         = 10.0      # penaliza distanza dalla linea
+W_LINE         = 100.0      # penaliza distanza dalla linea
 LINE_EXP       = 2.5       # esponente penalita' linea
 W_HEADING      = 5.0       # penaliza heading error (auto non punta nella dir. giusta)
 W_BRAKING      = 5.0       # penaliza entrata troppo veloce in curva
@@ -203,6 +203,8 @@ class AssettoCorsaEnv(gym.Env):
         """Legge telemetria + posizione + checkpoint info."""
         self.asm.update()
         x, z   = get_car_position()
+
+        #print(x, z)
         dist, _ = self.kdtree.query([x, z])
         cp_info = self.checkpoints.update(x, z)
 
@@ -273,6 +275,8 @@ class AssettoCorsaEnv(gym.Env):
         progress_r = state["progress_reward"] * W_PROGRESS
 
         # Negativi — linea
+
+        #print(state["dist"])
         dist_p      = -(state["dist"] ** LINE_EXP) * W_LINE
         backtrack_p = state["backtrack_penalty"] * W_BACKTRACK
 
@@ -290,7 +294,7 @@ class AssettoCorsaEnv(gym.Env):
 
         if state["tyres_out"] >= MAX_TYRES_OUT:
             reward += PENALTY_TYRES
-
+        print(reward)
         return float(reward)
 
     # ------------------------------------------------------------------

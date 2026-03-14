@@ -22,12 +22,24 @@ _SM_PHYSICS   = "Local\\acpmf_physics"
 _SM_GRAPHICS  = "Local\\acpmf_graphics"
 _SM_STATIC    = "Local\\AcTools.Static"
 
-# Offset nella SM graphics per posizione X, Y, Z della telecamera (proxy posizione auto)
-# Layout: vedi documentazione AC shared memory
-# I campi rilevanti in acpmf_graphics partono con: packetId(i), status(i), session(i),
-# currentTime / lastTime / bestTime (3x 15 char unicode = 30 bytes ciascuna) ...
-# La posizione cameraPosition è a offset 716 in float[3]: X, Y, Z
-_GRAPHICS_POS_OFFSET = 716   # byte offset per cameraPosition[3] (X, Y, Z) — float
+# Offset nella SM graphics per carCoordinates[3] (posizione WORLD della macchina)
+# Struttura SPageFileGraphic (MSVC packed, wchar_t = 2 byte su Windows):
+#   0  : packetId (int 4)
+#   4  : status   (int 4)
+#   8  : session  (int 4)
+#   12 : currentTime  wchar_t[15] = 30 byte
+#   42 : lastTime     wchar_t[15] = 30 byte
+#   72 : bestTime     wchar_t[15] = 30 byte
+#   102: split        wchar_t[15] = 30 byte
+#   132: completedLaps, position, iCurrentTime, iLastTime, iBestTime  (5x int = 20)
+#   152: sessionTimeLeft, distanceTraveled (2x float = 8)
+#   160: isInPit, currentSectorIndex, lastSectorTime, numberOfLaps (4x int = 16)
+#   176: tyreCompound wchar_t[33] = 66 byte  → fine a 242
+#   242: 2 byte padding (allineamento float a 4 byte)
+#   244: replayTimeMultiplier (float 4)
+#   248: normalizedCarPosition (float 4)
+#   252: carCoordinates[3]  ← X, Y, Z in world space  ← QUESTO vogliamo
+_GRAPHICS_CAR_POS_OFFSET = 252   # byte offset per carCoordinates[3] (X, Y, Z) — float
 
 
 # ---------------------------------------------------------------------------
@@ -234,15 +246,17 @@ class CheckpointSystem:
 def get_car_position() -> tuple[float, float]:
     """
     Legge X, Z della posizione auto dalla Shared Memory Graphics di AC.
-    Ritorna (0.0, 0.0) se la SM non è disponibile.
+    Usa il campo carCoordinates[3] (posizione world della macchina).
+    Ritorna (0.0, 0.0) se la SM non è disponibile (AC non in esecuzione).
     """
     try:
-        shm = mmap.mmap(-1, _GRAPHICS_POS_OFFSET + 12, _SM_GRAPHICS, access=mmap.ACCESS_READ)
-        shm.seek(_GRAPHICS_POS_OFFSET)
+        shm = mmap.mmap(-1, _GRAPHICS_CAR_POS_OFFSET + 12, _SM_GRAPHICS, access=mmap.ACCESS_READ)
+        shm.seek(_GRAPHICS_CAR_POS_OFFSET)
         x, y, z = struct.unpack('fff', shm.read(12))
         shm.close()
         return float(x), float(z)
-    except Exception:
+    except Exception as e:
+        print(f"[Driver] WARN get_car_position fallito: {e}")
         return 0.0, 0.0
 
 
@@ -428,7 +442,9 @@ def send_reset_to_ac(delay: float = 0.3) -> None:
         import time as _t
         _t.sleep(delay)                          # attendi che si apra il menu
         pyautogui.click(*AC_RESTART_CLICK_POS)
+        _t.sleep(1)
         pyautogui.click(*AC_RESTART_CLICK_POS)
+        _t.sleep(1)
         pyautogui.click(*AC_RESTART_CLICK_POS)
         print(f"[Driver] Click restart @ {AC_RESTART_CLICK_POS}")
 
