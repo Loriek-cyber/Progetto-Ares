@@ -39,7 +39,7 @@ from utils.driver import (
 # ---------------------------------------------------------------------------
 
 BASE_TRACK_PATH = "C:/Users/Arjel/Giochi/Assetto Corsa/content/tracks"
-MAX_DIST_RESET  = 8.0      # m — distanza reset (identica a main.py)
+MAX_DIST_RESET  = 800.0      # m — distanza reset (identica a main.py)
 MAX_TYRES_OUT   = 3
 CAR_DAMAGE_MAX  = 1
 STEP_DELAY      = 0.001    # secondi tra step

@@ -1,17 +1,4 @@
-"""
-train_sim.py — Training parallelo PPO sul simulatore AC
-=======================================================
-Addestra un modello PPO usando N_ENVS istanze in parallelo del simulatore
-fisico, senza bisogno di Assetto Corsa in esecuzione.
 
-Il modello risultante è direttamente caricabile in main.py per il fine-tuning
-sul gioco reale (stessa obs/action space).
-
-Uso:
-    python train_sim.py                   # avvia nuovo training
-    python train_sim.py --resume          # riprende dall'ultimo checkpoint
-    python train_sim.py --envs 32         # usa 32 ambienti paralleli
-"""
 
 import os
 import sys
