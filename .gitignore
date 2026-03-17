@@ -3,3 +3,4 @@
 /models/
 /models_sim/
 /logs_sim/
+.venv/
